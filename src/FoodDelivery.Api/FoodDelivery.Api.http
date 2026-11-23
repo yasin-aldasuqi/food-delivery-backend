@@ -1,26 +1,68 @@
 @host = http://localhost:5127
 
-### List restaurants (paged)
-GET {{host}}/api/restaurants?page=1&pageSize=20
-Accept: application/json
+### ===== Auth =====
 
-### Get one restaurant
+### Register a restaurant owner
+POST {{host}}/api/auth/register
+Content-Type: application/json
+
+{
+  "fullName": "Owner One",
+  "email": "owner@example.com",
+  "password": "Passw0rd!",
+  "role": "RestaurantOwner"
+}
+
+### Register a customer (role defaults to Customer; Admin is rejected)
+POST {{host}}/api/auth/register
+Content-Type: application/json
+
+{
+  "fullName": "Customer One",
+  "email": "customer@example.com",
+  "password": "Passw0rd!"
+}
+
+### Log in as the owner — the token is reused below
+# @name loginOwner
+POST {{host}}/api/auth/login
+Content-Type: application/json
+
+{
+  "email": "owner@example.com",
+  "password": "Passw0rd!"
+}
+
+###
+@ownerToken = {{loginOwner.response.body.token}}
+
+### Who am I?
+GET {{host}}/api/auth/me
+Authorization: Bearer {{ownerToken}}
+
+### ===== Restaurants =====
+
+### List restaurants (public)
+GET {{host}}/api/restaurants?page=1&pageSize=20
+
+### Get one restaurant (public)
 GET {{host}}/api/restaurants/1
 
-### Create a restaurant (OwnerId must be an existing user — temporary until auth)
+### Create a restaurant (RestaurantOwner; owner is taken from the token)
 POST {{host}}/api/restaurants
+Authorization: Bearer {{ownerToken}}
 Content-Type: application/json
 
 {
   "name": "Shawarma House",
   "description": "Chicken and beef shawarma",
   "address": "King Fahd Rd, Riyadh",
-  "phoneNumber": "+966500000000",
-  "ownerId": 1
+  "phoneNumber": "+966500000000"
 }
 
-### Update a restaurant
+### Update a restaurant (its owner or Admin)
 PUT {{host}}/api/restaurants/1
+Authorization: Bearer {{ownerToken}}
 Content-Type: application/json
 
 {
@@ -29,17 +71,20 @@ Content-Type: application/json
   "isActive": true
 }
 
-### Validation error example (empty name → 400)
+### Without a token → 401
 POST {{host}}/api/restaurants
 Content-Type: application/json
 
-{ "name": "", "address": "x", "ownerId": 1 }
+{ "name": "No Auth", "address": "x" }
 
-### List a restaurant's menu
+### ===== Menu items =====
+
+### List a restaurant's menu (public)
 GET {{host}}/api/restaurants/1/menu-items
 
-### Add a menu item
+### Add a menu item (restaurant's owner or Admin)
 POST {{host}}/api/restaurants/1/menu-items
+Authorization: Bearer {{ownerToken}}
 Content-Type: application/json
 
 {
@@ -48,5 +93,6 @@ Content-Type: application/json
   "category": "Sandwiches"
 }
 
-### Delete a menu item
+### Delete a menu item (restaurant's owner or Admin)
 DELETE {{host}}/api/restaurants/1/menu-items/1
+Authorization: Bearer {{ownerToken}}

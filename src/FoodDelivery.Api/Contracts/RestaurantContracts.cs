@@ -25,10 +25,7 @@ public record CreateRestaurantRequest
     [Phone, StringLength(20)]
     public string? PhoneNumber { get; init; }
 
-    // TEMPORARY: once authentication is added, the owner will come
-    // from the logged-in user's token, not from the request body.
-    [Range(1, int.MaxValue)]
-    public int OwnerId { get; init; }
+    // No OwnerId here on purpose: the owner is always the logged-in user (from the JWT).
 }
 
 public record UpdateRestaurantRequest

@@ -1,6 +1,8 @@
+using FoodDelivery.Api.Auth;
 using FoodDelivery.Api.Contracts;
 using FoodDelivery.Api.Data;
 using FoodDelivery.Api.Entities;
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 
@@ -12,8 +14,9 @@ public class RestaurantsController(AppDbContext db) : ControllerBase
 {
     private const int MaxPageSize = 100;
 
-    // GET /api/restaurants?page=1&pageSize=20
+    // GET /api/restaurants?page=1&pageSize=20  (public)
     [HttpGet]
+    [AllowAnonymous]
     public async Task<ActionResult<PagedResponse<RestaurantResponse>>> GetAll(
         [FromQuery] int page = 1,
         [FromQuery] int pageSize = 20,
@@ -37,38 +40,43 @@ public class RestaurantsController(AppDbContext db) : ControllerBase
         return Ok(new PagedResponse<RestaurantResponse>(items, page, pageSize, totalCount));
     }
 
-    // GET /api/restaurants/5
+    // GET /api/restaurants/5  (public; inactive restaurants visible only to owner/admin)
     [HttpGet("{id:int}")]
+    [AllowAnonymous]
     public async Task<ActionResult<RestaurantResponse>> GetById(int id, CancellationToken ct)
     {
         var restaurant = await db.Restaurants
             .Where(r => r.Id == id)
-            .Select(r => new RestaurantResponse(
-                r.Id, r.Name, r.Description, r.Address, r.PhoneNumber, r.IsActive, r.CreatedAt))
+            .Select(r => new
+            {
+                r.OwnerId,
+                Response = new RestaurantResponse(
+                    r.Id, r.Name, r.Description, r.Address, r.PhoneNumber, r.IsActive, r.CreatedAt)
+            })
             .FirstOrDefaultAsync(ct);
 
-        return restaurant is null ? NotFound() : Ok(restaurant);
+        if (restaurant is null) return NotFound();
+
+        var canSeeInactive = User.Identity?.IsAuthenticated == true
+                             && User.CanManageRestaurant(restaurant.OwnerId);
+        if (!restaurant.Response.IsActive && !canSeeInactive) return NotFound();
+
+        return Ok(restaurant.Response);
     }
 
-    // POST /api/restaurants
+    // POST /api/restaurants  (restaurant owners only; owner = the caller)
     [HttpPost]
+    [Authorize(Roles = Roles.RestaurantOwner)]
     public async Task<ActionResult<RestaurantResponse>> Create(
         CreateRestaurantRequest request, CancellationToken ct)
     {
-        var ownerExists = await db.Users.AnyAsync(u => u.Id == request.OwnerId, ct);
-        if (!ownerExists)
-        {
-            ModelState.AddModelError(nameof(request.OwnerId), "Owner does not exist.");
-            return ValidationProblem(ModelState);
-        }
-
         var restaurant = new Restaurant
         {
             Name = request.Name,
             Description = request.Description,
             Address = request.Address,
             PhoneNumber = request.PhoneNumber,
-            OwnerId = request.OwnerId
+            OwnerId = User.GetUserId() // from the verified token, never from the body
         };
 
         db.Restaurants.Add(restaurant);
@@ -82,12 +90,14 @@ public class RestaurantsController(AppDbContext db) : ControllerBase
         return CreatedAtAction(nameof(GetById), new { id = restaurant.Id }, response);
     }
 
-    // PUT /api/restaurants/5
+    // PUT /api/restaurants/5  (owner of this restaurant, or admin)
     [HttpPut("{id:int}")]
+    [Authorize(Roles = $"{Roles.RestaurantOwner},{Roles.Admin}")]
     public async Task<IActionResult> Update(int id, UpdateRestaurantRequest request, CancellationToken ct)
     {
         var restaurant = await db.Restaurants.FindAsync([id], ct);
         if (restaurant is null) return NotFound();
+        if (!User.CanManageRestaurant(restaurant.OwnerId)) return Forbid();
 
         restaurant.Name = request.Name;
         restaurant.Description = request.Description;
@@ -99,12 +109,14 @@ public class RestaurantsController(AppDbContext db) : ControllerBase
         return NoContent();
     }
 
-    // DELETE /api/restaurants/5
+    // DELETE /api/restaurants/5  (owner of this restaurant, or admin)
     [HttpDelete("{id:int}")]
+    [Authorize(Roles = $"{Roles.RestaurantOwner},{Roles.Admin}")]
     public async Task<IActionResult> Delete(int id, CancellationToken ct)
     {
         var restaurant = await db.Restaurants.FindAsync([id], ct);
         if (restaurant is null) return NotFound();
+        if (!User.CanManageRestaurant(restaurant.OwnerId)) return Forbid();
 
         // Orders are financial records (FK is ON DELETE RESTRICT).
         if (await db.Orders.AnyAsync(o => o.RestaurantId == id, ct))
