@@ -49,6 +49,15 @@ public class ApiFactory : WebApplicationFactory<Program>, IAsyncLifetime
         // UseSetting is applied early enough for values Program.cs reads while building.
         builder.UseSetting("ConnectionStrings:Default", _connectionString);
         builder.UseSetting("Jwt:Key", TestJwtKey);
+
+        // In-memory test requests have no client IP, so every test shares one rate-limit
+        // partition. Effectively disable the limits here; RateLimitingTests uses its own
+        // factory with small limits.
+        foreach (var policy in new[] { "Login", "Register" })
+        {
+            builder.UseSetting($"RateLimiting:{policy}:PermitLimit", "100000");
+            builder.UseSetting($"RateLimiting:{policy}:WindowSeconds", "60");
+        }
     }
 
     public new async Task DisposeAsync()

@@ -56,6 +56,9 @@ builder.Services.AddAuthorizationBuilder()
         .RequireAuthenticatedUser()
         .Build());
 
+// --- Rate limiting (login/register, per client IP) ---
+builder.Services.AddAuthRateLimiting(builder.Configuration);
+
 builder.Services.AddSingleton<TokenService>();
 builder.Services.AddSingleton<IPasswordHasher<User>, PasswordHasher<User>>();
 
@@ -76,6 +79,7 @@ if (app.Environment.IsDevelopment())
 
 app.UseHttpsRedirection();
 
+app.UseRateLimiter();    // reject excess requests as cheaply as possible
 app.UseAuthentication(); // who are you?
 app.UseAuthorization();  // what are you allowed to do?
 
