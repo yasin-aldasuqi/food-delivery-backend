@@ -28,6 +28,7 @@ Built with **ASP.NET Core (.NET 10)**, **Entity Framework Core**, and **PostgreS
 - **Order workflow.** A state machine controls status changes: `Pending → Confirmed → Preparing → OutForDelivery → Delivered`, or `Cancelled`.
 - **Concurrency safety.** Simultaneous updates to the same order are detected instead of silently overwriting each other.
 - **History is preserved.** Past orders keep the item names and prices that were in effect when they were placed.
+- **Rate limiting.** Login is limited to 5 attempts per minute and registration to 5 accounts per hour, for each client IP. Requests over the limit get `429` with a `Retry-After` header.
 - **Idempotent order creation.** Retrying `POST /api/orders` with the same `Idempotency-Key` returns the original order instead of creating a duplicate, even when the retries arrive at the same moment.
 
 ## Tech stack
@@ -81,12 +82,16 @@ UPDATE "Users" SET "Role" = 'Admin' WHERE "Email" = 'you@example.com';
 
 Then log in again. The role is read from the token, so the old token still carries the previous role.
 
+### Rate limits during development
+
+Login allows 5 attempts per minute and registration allows 5 accounts per hour per IP. These limits also apply while you test manually. To raise them locally, add a `RateLimiting` section to `appsettings.Development.json` with the same shape as the one in `appsettings.json`.
+
 ## API overview
 
 | Method | Endpoint | Access |
 |---|---|---|
-| `POST` | `/api/auth/register` | Public (role: `Customer` or `RestaurantOwner`) |
-| `POST` | `/api/auth/login` | Public |
+| `POST` | `/api/auth/register` | Public (role: `Customer` or `RestaurantOwner`); rate-limited |
+| `POST` | `/api/auth/login` | Public; rate-limited |
 | `GET` | `/api/auth/me` | Any authenticated user |
 | `GET` | `/api/restaurants?page=&pageSize=` | Public |
 | `GET` | `/api/restaurants/{id}` | Public; inactive restaurants are visible only to their owner and admins |
@@ -99,7 +104,7 @@ Then log in again. The role is read from the token, so the old token still carri
 | `GET` | `/api/orders/{id}` | The customer, the restaurant's owner, or `Admin` (404 for anyone else) |
 | `PATCH` | `/api/orders/{id}/status` | Depends on the transition; see [Order lifecycle](#order-lifecycle) |
 
-Errors use the standard [Problem Details](https://www.rfc-editor.org/rfc/rfc9457) format: `400` for validation errors, `401` when the caller isn't authenticated, `403` when the caller isn't allowed, `404` for missing (or private) resources, `409` for conflicts, and `422` when an `Idempotency-Key` is reused for a different request.
+Errors use the standard [Problem Details](https://www.rfc-editor.org/rfc/rfc9457) format: `400` for validation errors, `401` when the caller isn't authenticated, `403` when the caller isn't allowed, `404` for missing (or private) resources, `409` for conflicts, `429` when a rate limit is exceeded, and `422` when an `Idempotency-Key` is reused for a different request.
 
 ## Data model
 
@@ -206,6 +211,15 @@ The allowed transitions are defined on the `Order` entity itself (`Order.CanTran
 - Only successful requests store a key, so a request that failed validation can be corrected and retried with the same key.
 - Concurrent duplicates are resolved by the database, not by the check-then-insert lookup. The second insert of the same `(UserId, Key)` waits for the first transaction, then fails with a unique violation. That rolls back its entire transaction, duplicate order included, and the API replays the winning order. The lookup is only a fast path for ordinary retries.
 
+**Rate limiting on authentication.** Without a limit, `/login` invites brute-force and credential-stuffing attacks. It is also an easy way to exhaust the CPU, because every attempt runs a deliberately slow PBKDF2 hash. ASP.NET Core's built-in rate limiter applies a **sliding window** per client IP to login and register:
+
+- A sliding window is used rather than a fixed one. A fixed window allows a burst of twice the limit across a window boundary, for example 5 requests at 12:00:59 and 5 more at 12:01:00.
+- Excess requests are rejected immediately (`QueueLimit = 0`) with `429`, a `Retry-After` header, and a log warning that includes the client IP. Queuing them would only hold connections open.
+- Every attempt counts, including successful ones, so guessing the right password after the limit doesn't help.
+- The rate limiter runs before authentication, so rejected requests cost as little as possible.
+- The sliding-window limiter doesn't report a retry time. `Retry-After` is therefore the length of one window segment, the earliest point at which a permit can be freed.
+- Limits are configured in `appsettings.json` and validated at startup. A limit of `0` would lock everyone out, so the app refuses to start with one.
+
 **Atomic writes.** An order and all of its lines are saved in a single `SaveChanges` call, which runs in one transaction. Either everything is saved or nothing is.
 
 **Efficient reads.** Queries project directly into DTOs, so only the needed columns are fetched. Order projections are written as `Expression<Func<...>>` trees, which EF Core can translate into a single SQL query. Lists are paged, the page size is capped, and the sort order is stable.
@@ -219,7 +233,7 @@ dotnet test
 | Suite | What it covers |
 |---|---|
 | **Unit** (15) | The order state machine: every allowed transition, the important disallowed ones, and the final states |
-| **Integration** (39) | The full HTTP pipeline: auth, ownership, order pricing, validation, visibility, the order workflow, history preservation, concurrency, and idempotency |
+| **Integration** (46) | The full HTTP pipeline: auth, ownership, order pricing, validation, visibility, the order workflow, history preservation, concurrency, idempotency, and rate limiting |
 
 The integration tests boot the real API in memory with `WebApplicationFactory`, apply the real EF Core migrations, and run against **real PostgreSQL**. EF Core's in-memory provider isn't used because it doesn't enforce unique indexes, check constraints, or `xmin`, so the tests that matter most would pass falsely. A few tests worth noting:
 
@@ -271,7 +285,8 @@ The workflow runs with read-only permissions, cancels superseded runs, and has a
 
 - **Idempotency key expiry.** Keys are kept forever. A scheduled cleanup job should delete keys older than about 24 hours, after which retries are no longer expected.
 - **Refresh tokens.** Access tokens expire after 60 minutes, and the user then has to log in again.
-- **Rate limiting** on `/api/auth/login` and `/api/auth/register`, to slow down credential stuffing. Registration also reveals whether an email is already taken (`409`), a common usability trade-off that rate limiting would mitigate.
+- **Rate limits are per IP, not per account.** An attacker with many IPs, such as a botnet, can still spread attempts across a single account. The complement is a temporary account lockout after repeated failed logins. Registration also still reveals whether an email is taken (`409`); rate limiting slows that down but doesn't remove it.
+- **Reverse proxy setup.** Behind a proxy or load balancer, every request appears to come from the proxy's IP. Configure `ForwardedHeaders` with the trusted proxies so that `RemoteIpAddress` is the real client, and never trust `X-Forwarded-For` directly.
 - **Couriers.** The `Courier` role exists in the model, but there is no delivery assignment yet; restaurant owners mark orders as delivered.
 - **Delivery fees and taxes.** Order totals are the sum of the item lines only.
 - **Admin management.** Admins are currently promoted directly in the database.
