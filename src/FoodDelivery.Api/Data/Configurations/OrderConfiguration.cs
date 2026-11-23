@@ -14,6 +14,9 @@ public class OrderConfiguration : IEntityTypeConfiguration<Order>
 
         builder.ToTable(t => t.HasCheckConstraint("CK_Orders_TotalAmount", "\"TotalAmount\" >= 0"));
 
+        // Optimistic concurrency via PostgreSQL's xmin system column (no real column is added).
+        builder.Property(o => o.Version).IsRowVersion();
+
         // Orders are financial records: block deleting the customer or restaurant behind them.
         builder.HasOne(o => o.Customer)
             .WithMany(u => u.Orders)

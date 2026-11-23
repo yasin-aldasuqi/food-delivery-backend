@@ -9,6 +9,9 @@ public class OrderItem
     // changes don't rewrite the history of past orders.
     public decimal UnitPrice { get; set; }
 
+    // Snapshot of the item's name at order time, for the same reason as UnitPrice.
+    public required string MenuItemName { get; set; }
+
     public int OrderId { get; set; }
     public Order Order { get; set; } = null!;
 

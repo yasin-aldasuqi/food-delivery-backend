@@ -9,6 +9,7 @@ public class OrderItemConfiguration : IEntityTypeConfiguration<OrderItem>
     public void Configure(EntityTypeBuilder<OrderItem> builder)
     {
         builder.Property(i => i.UnitPrice).HasPrecision(10, 2);
+        builder.Property(i => i.MenuItemName).HasMaxLength(150);
 
         builder.ToTable(t =>
         {
