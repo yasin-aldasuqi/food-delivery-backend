@@ -56,6 +56,15 @@ builder.Services.AddAuthorizationBuilder()
         .RequireAuthenticatedUser()
         .Build());
 
+// --- Account lockout (per account, complements the per-IP rate limit) ---
+builder.Services.AddOptions<AccountLockoutOptions>()
+    .Bind(builder.Configuration.GetSection(AccountLockoutOptions.SectionName))
+    .ValidateDataAnnotations()
+    .ValidateOnStart();
+
+// Injected instead of calling DateTime.UtcNow, so tests can move time forward.
+builder.Services.AddSingleton(TimeProvider.System);
+
 // --- Rate limiting (login/register, per client IP) ---
 builder.Services.AddAuthRateLimiting(builder.Configuration);
 

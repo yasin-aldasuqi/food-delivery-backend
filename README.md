@@ -29,6 +29,7 @@ Built with **ASP.NET Core (.NET 10)**, **Entity Framework Core**, and **PostgreS
 - **Concurrency safety.** Simultaneous updates to the same order are detected instead of silently overwriting each other.
 - **History is preserved.** Past orders keep the item names and prices that were in effect when they were placed.
 - **Rate limiting.** Login is limited to 5 attempts per minute and registration to 5 accounts per hour, for each client IP. Requests over the limit get `429` with a `Retry-After` header.
+- **Account lockout.** After 5 consecutive failed logins, an account is locked for 15 minutes, no matter how many IPs the attempts come from. A locked account answers exactly like a wrong password, so the lockout doesn't reveal that the account exists.
 - **Idempotent order creation.** Retrying `POST /api/orders` with the same `Idempotency-Key` returns the original order instead of creating a duplicate, even when the retries arrive at the same moment.
 
 ## Tech stack
@@ -82,9 +83,15 @@ UPDATE "Users" SET "Role" = 'Admin' WHERE "Email" = 'you@example.com';
 
 Then log in again. The role is read from the token, so the old token still carries the previous role.
 
-### Rate limits during development
+### Rate limits and lockout during development
 
-Login allows 5 attempts per minute and registration allows 5 accounts per hour per IP. These limits also apply while you test manually. To raise them locally, add a `RateLimiting` section to `appsettings.Development.json` with the same shape as the one in `appsettings.json`.
+Login allows 5 attempts per minute and registration allows 5 accounts per hour per IP. These limits also apply while you test manually. To raise them locally, add `RateLimiting` and/or `Lockout` sections to `appsettings.Development.json`, with the same shape as the ones in `appsettings.json`.
+
+After 5 wrong passwords, the account is locked for 15 minutes, and during that time even the correct password returns `401`. To unlock an account right away:
+
+```sql
+UPDATE "Users" SET "FailedLoginCount" = 0, "LockoutEnd" = NULL WHERE "Email" = 'you@example.com';
+```
 
 ## API overview
 
@@ -220,6 +227,14 @@ The allowed transitions are defined on the `Order` entity itself (`Order.CanTran
 - The sliding-window limiter doesn't report a retry time. `Retry-After` is therefore the length of one window segment, the earliest point at which a permit can be freed.
 - Limits are configured in `appsettings.json` and validated at startup. A limit of `0` would lock everyone out, so the app refuses to start with one.
 
+**Account lockout.** The rate limit is per IP, so an attacker with many IPs can still keep guessing one account's password. Lockout limits guesses per account instead: after `MaxFailedAttempts` (5) consecutive failures, the account is locked for `DurationMinutes` (15), so no account can receive more than about 5 guesses per 15 minutes. The design has three tricky parts:
+
+- **What a locked account returns.** A distinct "account locked" message would reveal that the email is registered, since unknown emails never lock. So a locked account returns the same `401` as a wrong password. The password isn't evaluated while the account is locked, so guessing during a lockout reveals nothing. The hash is still computed, with the result ignored, so the timing stays the same. The trade-off is that a legitimate user isn't told they are locked out; the usual remedy is an email notification.
+- **Lockout as a weapon.** Anyone who knows an email can lock that account on purpose (lockout DoS). This is limited by the short duration, by not extending the lockout on attempts made during it, and by the per-IP rate limit. Stronger options, not implemented here, are CAPTCHA, progressive delays, and MFA.
+- **Concurrent failures.** The counter is incremented with a single atomic `UPDATE ... SET "FailedLoginCount" = "FailedLoginCount" + 1` that also sets `LockoutEnd` when the limit is reached. A read-modify-write in C# would let parallel failures overwrite each other and never reach the limit. A test proves this: with the counter deliberately rewritten as read-modify-write, the parallel test failed in 3 out of 3 runs. A successful login resets the counter only if no concurrent failure has locked the account in the meantime; that condition is checked inside the same `UPDATE`.
+
+Time comes from an injected `TimeProvider`, not from `DateTime.UtcNow`, so the tests can move the clock forward past a lockout instead of waiting 15 minutes.
+
 **Atomic writes.** An order and all of its lines are saved in a single `SaveChanges` call, which runs in one transaction. Either everything is saved or nothing is.
 
 **Efficient reads.** Queries project directly into DTOs, so only the needed columns are fetched. Order projections are written as `Expression<Func<...>>` trees, which EF Core can translate into a single SQL query. Lists are paged, the page size is capped, and the sort order is stable.
@@ -233,7 +248,7 @@ dotnet test
 | Suite | What it covers |
 |---|---|
 | **Unit** (15) | The order state machine: every allowed transition, the important disallowed ones, and the final states |
-| **Integration** (46) | The full HTTP pipeline: auth, ownership, order pricing, validation, visibility, the order workflow, history preservation, concurrency, idempotency, and rate limiting |
+| **Integration** (54) | The full HTTP pipeline: auth, ownership, order pricing, validation, visibility, the order workflow, history preservation, concurrency, idempotency, rate limiting, and account lockout |
 
 The integration tests boot the real API in memory with `WebApplicationFactory`, apply the real EF Core migrations, and run against **real PostgreSQL**. EF Core's in-memory provider isn't used because it doesn't enforce unique indexes, check constraints, or `xmin`, so the tests that matter most would pass falsely. A few tests worth noting:
 
@@ -285,7 +300,9 @@ The workflow runs with read-only permissions, cancels superseded runs, and has a
 
 - **Idempotency key expiry.** Keys are kept forever. A scheduled cleanup job should delete keys older than about 24 hours, after which retries are no longer expected.
 - **Refresh tokens.** Access tokens expire after 60 minutes, and the user then has to log in again.
-- **Rate limits are per IP, not per account.** An attacker with many IPs, such as a botnet, can still spread attempts across a single account. The complement is a temporary account lockout after repeated failed logins. Registration also still reveals whether an email is taken (`409`); rate limiting slows that down but doesn't remove it.
+- **Lockout trade-offs.** A locked-out user isn't told why their login fails, and there is no admin endpoint to unlock an account (see the SQL above). Lockout can also be triggered on purpose against a known email; the short duration limits the damage. Tokens issued before a lockout stay valid until they expire (60 minutes), because lockout blocks new logins only.
+- **In-flight attempts.** Requests that started before the account locked still have their passwords checked. A burst of parallel attempts can therefore exceed the limit slightly; the per-IP rate limit keeps such bursts small. Reserving an attempt before checking the password would close this gap completely.
+- **Registration still reveals taken emails** (`409`). Rate limiting slows this down but doesn't remove it.
 - **Reverse proxy setup.** Behind a proxy or load balancer, every request appears to come from the proxy's IP. Configure `ForwardedHeaders` with the trusted proxies so that `RemoteIpAddress` is the real client, and never trust `X-Forwarded-For` directly.
 - **Couriers.** The `Courier` role exists in the model, but there is no delivery assignment yet; restaurant owners mark orders as delivered.
 - **Delivery fees and taxes.** Order totals are the sum of the item lines only.

@@ -14,7 +14,7 @@ public class RateLimitingTests : IDisposable
     private const int WindowSeconds = 60;
 
     private readonly ApiFactory _shared;
-    private readonly RateLimitedApiFactory _limited;
+    private readonly IsolatedApiFactory _limited;
 
     public RateLimitingTests(ApiFactory shared)
     {
@@ -117,7 +117,7 @@ public class RateLimitingTests : IDisposable
         Assert.Contains("RateLimiting", error.ToString());
     }
 
-    private RateLimitedApiFactory CreateLimitedFactory(int loginLimit, int registerLimit) =>
+    private IsolatedApiFactory CreateLimitedFactory(int loginLimit, int registerLimit) =>
         new(_shared.GetConnectionString(), new Dictionary<string, string?>
         {
             ["RateLimiting:Login:PermitLimit"] = loginLimit.ToString(),

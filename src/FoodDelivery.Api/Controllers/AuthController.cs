@@ -7,6 +7,7 @@ using Microsoft.AspNetCore.Identity;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Options;
 using Npgsql;
 
 namespace FoodDelivery.Api.Controllers;
@@ -16,8 +17,13 @@ namespace FoodDelivery.Api.Controllers;
 public class AuthController(
     AppDbContext db,
     IPasswordHasher<User> passwordHasher,
-    TokenService tokenService) : ControllerBase
+    TokenService tokenService,
+    IOptions<AccountLockoutOptions> lockoutOptions,
+    TimeProvider timeProvider,
+    ILogger<AuthController> logger) : ControllerBase
 {
+    private readonly AccountLockoutOptions _lockout = lockoutOptions.Value;
+
     // Roles a user may pick for themselves. Admin is never self-assignable.
     private static readonly UserRole[] SelfRegisterRoles = [UserRole.Customer, UserRole.RestaurantOwner];
 
@@ -83,8 +89,33 @@ public class AuthController(
             return InvalidCredentials();
         }
 
+        var now = timeProvider.GetUtcNow().UtcDateTime;
+
+        if (user.LockoutEnd > now)
+        {
+            // Locked: don't even look at whether the password is right, so guessing during a
+            // lockout reveals nothing. Hash anyway (result ignored) to keep the timing the same,
+            // and answer exactly like a wrong password so the lockout doesn't reveal that the
+            // account exists. Attempts during a lockout don't extend it.
+            passwordHasher.VerifyHashedPassword(user, user.PasswordHash, request.Password);
+            return InvalidCredentials();
+        }
+
         var result = passwordHasher.VerifyHashedPassword(user, user.PasswordHash, request.Password);
         if (result == PasswordVerificationResult.Failed)
+        {
+            await RegisterFailedLoginAsync(user.Id, now, ct);
+            return InvalidCredentials();
+        }
+
+        // Reset the failure counter, but only if no concurrent failed attempt has locked the
+        // account since we read it (the condition is checked inside the UPDATE itself).
+        var reset = await db.Users
+            .Where(u => u.Id == user.Id && (u.LockoutEnd == null || u.LockoutEnd <= now))
+            .ExecuteUpdateAsync(s => s
+                .SetProperty(u => u.FailedLoginCount, 0)
+                .SetProperty(u => u.LockoutEnd, (DateTime?)null), ct);
+        if (reset == 0)
             return InvalidCredentials();
 
         if (result == PasswordVerificationResult.SuccessRehashNeeded)
@@ -110,6 +141,35 @@ public class AuthController(
 
         // Token is valid but the account was deleted after it was issued.
         return user is null ? Unauthorized() : Ok(user);
+    }
+
+    // Counts a failed login atomically in the database (no read-modify-write in C#, so
+    // concurrent failures can't overwrite each other). The attempt that reaches the limit
+    // locks the account and resets the counter, so the user gets a fresh set of attempts
+    // once the lockout ends. Failures while already locked are not counted.
+    private async Task RegisterFailedLoginAsync(int userId, DateTime now, CancellationToken ct)
+    {
+        var max = _lockout.MaxFailedAttempts;
+        DateTime? lockUntil = now.AddMinutes(_lockout.DurationMinutes);
+
+        // In SQL every SET expression sees the row's old values, so both CASEs agree.
+        await db.Users
+            .Where(u => u.Id == userId && (u.LockoutEnd == null || u.LockoutEnd <= now))
+            .ExecuteUpdateAsync(s => s
+                .SetProperty(u => u.LockoutEnd, u => u.FailedLoginCount + 1 >= max ? lockUntil : u.LockoutEnd)
+                .SetProperty(u => u.FailedLoginCount, u => u.FailedLoginCount + 1 >= max ? 0 : u.FailedLoginCount + 1), ct);
+
+        var lockedUntil = await db.Users
+            .Where(u => u.Id == userId && u.LockoutEnd > now)
+            .Select(u => u.LockoutEnd)
+            .FirstOrDefaultAsync(ct);
+
+        if (lockedUntil is not null)
+        {
+            // Log the user id, not the email: logs travel widely and shouldn't carry personal data.
+            logger.LogWarning("Account {UserId} locked until {LockoutEnd} after {MaxFailedAttempts} failed logins",
+                userId, lockedUntil, max);
+        }
     }
 
     private AuthResponse ToAuthResponse(User user)
