@@ -17,7 +17,7 @@ public class OrdersTests(ApiFactory factory)
         var restaurant = await owner.CreateRestaurantWithMenuAsync();
 
         // A tampered request trying to pay almost nothing.
-        var response = await customer.Client.PostAsJsonAsync("/api/orders", new
+        var response = await customer.PostOrderAsync(new
         {
             restaurantId = restaurant.Id,
             deliveryAddress = "Home",
@@ -27,7 +27,7 @@ public class OrdersTests(ApiFactory factory)
                 new { menuItemId = restaurant.BurgerId, quantity = 2, unitPrice = 0.01 },
                 new { menuItemId = restaurant.FriesId, quantity = 1 }
             }
-        });
+        }, Guid.NewGuid().ToString());
 
         Assert.Equal(HttpStatusCode.Created, response.StatusCode);
         var order = await response.ReadAsync<OrderResponse>();

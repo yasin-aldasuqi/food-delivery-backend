@@ -74,14 +74,51 @@ public static class TestHelpers
         return client;
     }
 
+    // POST /api/orders with any body and an explicit Idempotency-Key (null = send no header).
+    public static Task<HttpResponseMessage> PostOrderAsync(this TestUser customer, object body, string? idempotencyKey)
+    {
+        var request = new HttpRequestMessage(HttpMethod.Post, "/api/orders")
+        {
+            Content = JsonContent.Create(body)
+        };
+        if (idempotencyKey is not null) request.Headers.Add("Idempotency-Key", idempotencyKey);
+        return customer.Client.SendAsync(request);
+    }
+
+    public static object OrderBody(int restaurantId, params (int MenuItemId, int Quantity)[] items) => new
+    {
+        restaurantId,
+        deliveryAddress = "Olaya St, Riyadh",
+        items = items.Select(i => new { menuItemId = i.MenuItemId, quantity = i.Quantity })
+    };
+
+    // Places an order with a fresh Idempotency-Key (a new, distinct order every call).
     public static Task<HttpResponseMessage> PlaceOrderAsync(
         this TestUser customer, int restaurantId, params (int MenuItemId, int Quantity)[] items) =>
-        customer.Client.PostAsJsonAsync("/api/orders", new
+        customer.PostOrderAsync(OrderBody(restaurantId, items), Guid.NewGuid().ToString());
+
+    // Polls PostgreSQL until some query is waiting on a lock (deterministic; no sleeps).
+    public static async Task WaitForBlockedQueryAsync(string connectionString)
+    {
+        await using var conn = new Npgsql.NpgsqlConnection(connectionString);
+        await conn.OpenAsync();
+        var deadline = DateTime.UtcNow.AddSeconds(10);
+
+        while (DateTime.UtcNow < deadline)
         {
-            restaurantId,
-            deliveryAddress = "Olaya St, Riyadh",
-            items = items.Select(i => new { menuItemId = i.MenuItemId, quantity = i.Quantity })
-        });
+            await using var cmd = new Npgsql.NpgsqlCommand("SELECT count(*) FROM pg_locks WHERE NOT granted", conn);
+            if ((long)(await cmd.ExecuteScalarAsync())! > 0) return;
+            await Task.Delay(20);
+        }
+
+        throw new TimeoutException("The API request never blocked on the lock.");
+    }
+
+    public static string GetConnectionString(this ApiFactory factory)
+    {
+        using var scope = factory.Services.CreateScope();
+        return scope.ServiceProvider.GetRequiredService<AppDbContext>().Database.GetConnectionString()!;
+    }
 
     public static async Task<OrderResponse> PlaceOrderOkAsync(
         this TestUser customer, int restaurantId, params (int MenuItemId, int Quantity)[] items)

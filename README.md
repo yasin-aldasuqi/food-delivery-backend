@@ -28,6 +28,7 @@ Built with **ASP.NET Core (.NET 10)**, **Entity Framework Core**, and **PostgreS
 - **Order workflow.** A state machine controls status changes: `Pending → Confirmed → Preparing → OutForDelivery → Delivered`, or `Cancelled`.
 - **Concurrency safety.** Simultaneous updates to the same order are detected instead of silently overwriting each other.
 - **History is preserved.** Past orders keep the item names and prices that were in effect when they were placed.
+- **Idempotent order creation.** Retrying `POST /api/orders` with the same `Idempotency-Key` returns the original order instead of creating a duplicate, even when the retries arrive at the same moment.
 
 ## Tech stack
 
@@ -93,12 +94,12 @@ Then log in again. The role is read from the token, so the old token still carri
 | `PUT` / `DELETE` | `/api/restaurants/{id}` | The restaurant's owner, or `Admin` |
 | `GET` | `/api/restaurants/{restaurantId}/menu-items[/{id}]` | Public |
 | `POST` / `PUT` / `DELETE` | `/api/restaurants/{restaurantId}/menu-items[/{id}]` | The restaurant's owner, or `Admin` |
-| `POST` | `/api/orders` | `Customer` |
+| `POST` | `/api/orders` | `Customer`; requires an `Idempotency-Key` header |
 | `GET` | `/api/orders?status=&page=&pageSize=` | Customer: own orders. Owner: orders for their restaurants. Admin: all orders |
 | `GET` | `/api/orders/{id}` | The customer, the restaurant's owner, or `Admin` (404 for anyone else) |
 | `PATCH` | `/api/orders/{id}/status` | Depends on the transition; see [Order lifecycle](#order-lifecycle) |
 
-Errors use the standard [Problem Details](https://www.rfc-editor.org/rfc/rfc9457) format: `400` for validation errors, `401` when the caller isn't authenticated, `403` when the caller isn't allowed, `404` for missing (or private) resources, and `409` for conflicts.
+Errors use the standard [Problem Details](https://www.rfc-editor.org/rfc/rfc9457) format: `400` for validation errors, `401` when the caller isn't authenticated, `403` when the caller isn't allowed, `404` for missing (or private) resources, `409` for conflicts, and `422` when an `Idempotency-Key` is reused for a different request.
 
 ## Data model
 
@@ -110,6 +111,8 @@ erDiagram
     Restaurants ||--o{ Orders : receives
     Orders ||--|{ OrderItems : contains
     MenuItems ||--o{ OrderItems : "ordered as"
+    Users ||--o{ IdempotencyKeys : sends
+    Orders ||--o| IdempotencyKeys : "created by"
 
     Users {
         int Id PK
@@ -145,6 +148,12 @@ erDiagram
         string MenuItemName "snapshot"
         decimal UnitPrice "snapshot"
         int Quantity "> 0"
+    }
+    IdempotencyKeys {
+        int UserId PK, FK
+        string Key PK "client-supplied, max 100"
+        string RequestHash "SHA-256 of the normalized request"
+        int OrderId FK
     }
 ```
 
@@ -189,6 +198,14 @@ The allowed transitions are defined on the `Order` entity itself (`Order.CanTran
 
 **Optimistic concurrency.** `Order` uses PostgreSQL's `xmin` system column as a concurrency token, so EF Core issues `UPDATE ... WHERE "Id" = @id AND xmin = @version`. Suppose an owner confirms an order at the same moment the customer cancels it. Whichever write lands second fails with `409` and doesn't overwrite the first. No extra column and no row locks are needed.
 
+**Idempotent order creation.** Networks can lose a response after the server has already processed the request. The client can't tell a lost request from a lost response, so it retries, and without protection that creates a second order and a second charge. Clients therefore send an `Idempotency-Key` header (for example, a UUID) that is new for each order and the same for every retry of it:
+
+- The key is stored together with the order in the same transaction, under the composite primary key `(UserId, Key)`, so keys are scoped per user.
+- A retry with the same key returns the original order with `201` and `Idempotent-Replayed: true`. The response reflects the order's current state.
+- The request is fingerprinted with a SHA-256 hash of a normalized form (items sorted, address trimmed). Reusing a key with a *different* request returns `422`, because that is a client bug rather than a retry.
+- Only successful requests store a key, so a request that failed validation can be corrected and retried with the same key.
+- Concurrent duplicates are resolved by the database, not by the check-then-insert lookup. The second insert of the same `(UserId, Key)` waits for the first transaction, then fails with a unique violation. That rolls back its entire transaction, duplicate order included, and the API replays the winning order. The lookup is only a fast path for ordinary retries.
+
 **Atomic writes.** An order and all of its lines are saved in a single `SaveChanges` call, which runs in one transaction. Either everything is saved or nothing is.
 
 **Efficient reads.** Queries project directly into DTOs, so only the needed columns are fetched. Order projections are written as `Expression<Func<...>>` trees, which EF Core can translate into a single SQL query. Lists are paged, the page size is capped, and the sort order is stable.
@@ -202,12 +219,13 @@ dotnet test
 | Suite | What it covers |
 |---|---|
 | **Unit** (15) | The order state machine: every allowed transition, the important disallowed ones, and the final states |
-| **Integration** (29) | The full HTTP pipeline: auth, ownership, order pricing, validation, visibility, the order workflow, history preservation, and concurrency |
+| **Integration** (39) | The full HTTP pipeline: auth, ownership, order pricing, validation, visibility, the order workflow, history preservation, concurrency, and idempotency |
 
 The integration tests boot the real API in memory with `WebApplicationFactory`, apply the real EF Core migrations, and run against **real PostgreSQL**. EF Core's in-memory provider isn't used because it doesn't enforce unique indexes, check constraints, or `xmin`, so the tests that matter most would pass falsely. A few tests worth noting:
 
 - **Forged token.** The test decodes a real customer token, changes its role to `Admin`, keeps the original signature, and expects `401`.
 - **Deterministic concurrency test.** The test holds a row lock from a raw connection, waits until PostgreSQL reports the API's `UPDATE` as blocked (`pg_locks`), then commits and expects `409`. There are no sleeps, so the test isn't timing-dependent.
+- **Deterministic idempotency race.** The test claims an idempotency key from an uncommitted transaction, lets the API create its own order and block on the key, then commits. It expects the API to roll back its duplicate and replay the winning order. A separate test fires 10 parallel requests with the same key and expects exactly one order.
 
 By default, Testcontainers starts a throwaway `postgres:16` container, which requires Docker. To use an existing database instead, set `TEST_DB_CONNECTION`. Don't point it at your development database, because the tests write data:
 
@@ -251,7 +269,7 @@ The workflow runs with read-only permissions, cancels superseded runs, and has a
 
 ## Known limitations and roadmap
 
-- **Idempotency keys for `POST /api/orders`.** Without them, a double-submitted request creates two orders.
+- **Idempotency key expiry.** Keys are kept forever. A scheduled cleanup job should delete keys older than about 24 hours, after which retries are no longer expected.
 - **Refresh tokens.** Access tokens expire after 60 minutes, and the user then has to log in again.
 - **Rate limiting** on `/api/auth/login` and `/api/auth/register`, to slow down credential stuffing. Registration also reveals whether an email is already taken (`409`), a common usability trade-off that rate limiting would mitigate.
 - **Couriers.** The `Courier` role exists in the model, but there is no delivery assignment yet; restaurant owners mark orders as delivered.

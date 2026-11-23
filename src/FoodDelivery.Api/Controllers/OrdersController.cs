@@ -1,5 +1,7 @@
 using System.Linq.Expressions;
 using System.Security.Claims;
+using System.Security.Cryptography;
+using System.Text.Json;
 using FoodDelivery.Api.Auth;
 using FoodDelivery.Api.Contracts;
 using FoodDelivery.Api.Data;
@@ -7,6 +9,7 @@ using FoodDelivery.Api.Entities;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
+using Npgsql;
 
 namespace FoodDelivery.Api.Controllers;
 
@@ -18,11 +21,34 @@ public class OrdersController(AppDbContext db) : ControllerBase
     private const int MaxPageSize = 100;
     private const decimal MaxOrderTotal = 99_999_999.99m; // fits numeric(10,2)
 
+    public const string IdempotencyKeyHeader = "Idempotency-Key";
+    public const string IdempotentReplayedHeader = "Idempotent-Replayed";
+
     // POST /api/orders  (customers only)
+    // Requires an Idempotency-Key header: retrying with the same key returns the
+    // original order instead of creating a duplicate.
     [HttpPost]
     [Authorize(Roles = Roles.Customer)]
-    public async Task<ActionResult<OrderResponse>> Create(CreateOrderRequest request, CancellationToken ct)
+    public async Task<ActionResult<OrderResponse>> Create(
+        CreateOrderRequest request,
+        [FromHeader(Name = IdempotencyKeyHeader)] string? idempotencyKey,
+        CancellationToken ct)
     {
+        if (string.IsNullOrWhiteSpace(idempotencyKey) || idempotencyKey.Length > IdempotencyKey.MaxKeyLength)
+        {
+            ModelState.AddModelError(IdempotencyKeyHeader,
+                $"The {IdempotencyKeyHeader} header is required (1-{IdempotencyKey.MaxKeyLength} characters). " +
+                "Send a new unique value (e.g. a UUID) per order, and the same value when retrying it.");
+            return ValidationProblem(ModelState);
+        }
+
+        var userId = User.GetUserId();
+        var requestHash = ComputeRequestHash(request);
+
+        // Fast path: a retry of a request that already succeeded.
+        var replay = await TryReplayAsync(userId, idempotencyKey, requestHash, ct);
+        if (replay is not null) return replay;
+
         var requestedIds = request.Items.Select(i => i.MenuItemId).ToList();
         if (requestedIds.Count != requestedIds.Distinct().Count())
         {
@@ -58,7 +84,7 @@ public class OrdersController(AppDbContext db) : ControllerBase
 
         var order = new Order
         {
-            CustomerId = User.GetUserId(),
+            CustomerId = userId,
             RestaurantId = restaurant.Id,
             DeliveryAddress = request.DeliveryAddress.Trim(),
             Status = OrderStatus.Pending
@@ -84,8 +110,32 @@ public class OrdersController(AppDbContext db) : ControllerBase
         }
 
         db.Orders.Add(order);
-        // One SaveChanges = one transaction: the order and all its lines are saved, or none are.
-        await db.SaveChangesAsync(ct);
+        db.IdempotencyKeys.Add(new IdempotencyKey
+        {
+            UserId = userId,
+            Key = idempotencyKey,
+            RequestHash = requestHash,
+            Order = order
+        });
+
+        // One SaveChanges = one transaction: the order, its lines and the idempotency key
+        // are saved together, or none of them are.
+        try
+        {
+            await db.SaveChangesAsync(ct);
+        }
+        catch (DbUpdateException ex) when (ex.InnerException is PostgresException
+                                           {
+                                               SqlState: PostgresErrorCodes.UniqueViolation,
+                                               ConstraintName: "PK_IdempotencyKeys"
+                                           })
+        {
+            // A concurrent request with the same key committed first. PostgreSQL rolled back
+            // our whole transaction (including our duplicate order), so replay theirs.
+            db.ChangeTracker.Clear();
+            return await TryReplayAsync(userId, idempotencyKey, requestHash, ct)
+                   ?? throw new InvalidOperationException("Idempotency key conflict, but no stored key was found.");
+        }
 
         var response = new OrderResponse(
             order.Id, restaurant.Id, restaurant.Name, order.CustomerId, order.Status,
@@ -178,6 +228,53 @@ public class OrdersController(AppDbContext db) : ControllerBase
         }
 
         return NoContent();
+    }
+
+    // Returns null if the key is unused; otherwise the original order (same request)
+    // or 422 (the key was already used for a different request).
+    private async Task<ActionResult?> TryReplayAsync(
+        int userId, string key, string requestHash, CancellationToken ct)
+    {
+        var stored = await db.IdempotencyKeys
+            .Where(k => k.UserId == userId && k.Key == key)
+            .Select(k => new { k.RequestHash, k.OrderId })
+            .FirstOrDefaultAsync(ct);
+
+        if (stored is null) return null;
+
+        if (stored.RequestHash != requestHash)
+        {
+            return Problem(
+                statusCode: StatusCodes.Status422UnprocessableEntity,
+                title: "Idempotency key reused",
+                detail: $"This {IdempotencyKeyHeader} was already used for a different order request. " +
+                        "Use a new key for a new order.");
+        }
+
+        var order = await db.Orders
+            .Where(o => o.Id == stored.OrderId)
+            .Select(ToResponse)
+            .SingleAsync(ct);
+
+        Response.Headers[IdempotentReplayedHeader] = "true";
+        return CreatedAtAction(nameof(GetById), new { id = order.Id }, order);
+    }
+
+    // Fingerprint of what the order request means, independent of item order and stray whitespace.
+    // Public so integration tests can reproduce the exact fingerprint.
+    public static string ComputeRequestHash(CreateOrderRequest request)
+    {
+        var canonical = new
+        {
+            request.RestaurantId,
+            DeliveryAddress = request.DeliveryAddress.Trim(),
+            Items = request.Items
+                .OrderBy(i => i.MenuItemId).ThenBy(i => i.Quantity)
+                .Select(i => new { i.MenuItemId, i.Quantity })
+        };
+
+        var bytes = JsonSerializer.SerializeToUtf8Bytes(canonical);
+        return Convert.ToHexStringLower(SHA256.HashData(bytes));
     }
 
     // The single place that decides which orders a user may see.
