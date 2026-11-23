@@ -42,7 +42,7 @@ public class ConcurrencyTests(ApiFactory factory)
     public async Task Api_returns_409_when_order_changes_while_it_is_being_updated()
     {
         var (orderId, owner) = await CreatePendingOrderWithOwnerAsync();
-        var connectionString = GetConnectionString();
+        var connectionString = factory.GetConnectionString();
 
         // 1) Another writer changes the order and holds the row lock (no commit yet).
         await using var conn = new NpgsqlConnection(connectionString);
@@ -61,7 +61,7 @@ public class ConcurrencyTests(ApiFactory factory)
 
         // 3) Wait until PostgreSQL itself reports the API's UPDATE waiting on a lock.
         //    No sleeps/guessing: this is deterministic.
-        await WaitForBlockedQueryAsync(connectionString);
+        await TestHelpers.WaitForBlockedQueryAsync(connectionString);
 
         // 4) Commit: xmin changes, so the API's "WHERE xmin = <old>" matches no row.
         await tx.CommitAsync();
@@ -69,28 +69,6 @@ public class ConcurrencyTests(ApiFactory factory)
 
         Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
         Assert.Equal("Order was modified", (await response.ReadAsync<ProblemDetails>()).Title);
-    }
-
-    private static async Task WaitForBlockedQueryAsync(string connectionString)
-    {
-        await using var conn = new NpgsqlConnection(connectionString);
-        await conn.OpenAsync();
-        var deadline = DateTime.UtcNow.AddSeconds(10);
-
-        while (DateTime.UtcNow < deadline)
-        {
-            await using var cmd = new NpgsqlCommand("SELECT count(*) FROM pg_locks WHERE NOT granted", conn);
-            if ((long)(await cmd.ExecuteScalarAsync())! > 0) return;
-            await Task.Delay(20);
-        }
-
-        throw new TimeoutException("The API request never blocked on the row lock.");
-    }
-
-    private string GetConnectionString()
-    {
-        using var scope = factory.Services.CreateScope();
-        return scope.ServiceProvider.GetRequiredService<AppDbContext>().Database.GetConnectionString()!;
     }
 
     private async Task<int> CreatePendingOrderAsync() => (await CreatePendingOrderWithOwnerAsync()).OrderId;

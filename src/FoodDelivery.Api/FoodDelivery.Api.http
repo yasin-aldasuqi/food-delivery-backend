@@ -113,9 +113,13 @@ Content-Type: application/json
 @customerToken = {{loginCustomer.response.body.token}}
 
 ### Place an order (Customer). Only ids + quantities: prices/total come from the server.
+# Idempotency-Key is required: use a new value for each new order, and the SAME value
+# when retrying. Send this request twice to see the retry return the same order
+# with "Idempotent-Replayed: true". Change the key to place another order.
 POST {{host}}/api/orders
 Authorization: Bearer {{customerToken}}
 Content-Type: application/json
+Idempotency-Key: 3f8e2a5c-7b1d-4e9a-9c6f-2d4b8a1e7f30
 
 {
   "restaurantId": 1,
