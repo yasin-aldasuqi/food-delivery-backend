@@ -1,6 +1,152 @@
-@FoodDelivery.Api_HostAddress = http://localhost:5127
+@host = http://localhost:5127
 
-GET {{FoodDelivery.Api_HostAddress}}/weatherforecast/
-Accept: application/json
+### ===== Auth =====
+
+### Register a restaurant owner
+POST {{host}}/api/auth/register
+Content-Type: application/json
+
+{
+  "fullName": "Owner One",
+  "email": "owner@example.com",
+  "password": "Passw0rd!",
+  "role": "RestaurantOwner"
+}
+
+### Register a customer (role defaults to Customer; Admin is rejected)
+POST {{host}}/api/auth/register
+Content-Type: application/json
+
+{
+  "fullName": "Customer One",
+  "email": "customer@example.com",
+  "password": "Passw0rd!"
+}
+
+### Log in as the owner — the token is reused below
+# @name loginOwner
+POST {{host}}/api/auth/login
+Content-Type: application/json
+
+{
+  "email": "owner@example.com",
+  "password": "Passw0rd!"
+}
 
 ###
+@ownerToken = {{loginOwner.response.body.token}}
+
+### Who am I?
+GET {{host}}/api/auth/me
+Authorization: Bearer {{ownerToken}}
+
+### ===== Restaurants =====
+
+### List restaurants (public)
+GET {{host}}/api/restaurants?page=1&pageSize=20
+
+### Get one restaurant (public)
+GET {{host}}/api/restaurants/1
+
+### Create a restaurant (RestaurantOwner; owner is taken from the token)
+POST {{host}}/api/restaurants
+Authorization: Bearer {{ownerToken}}
+Content-Type: application/json
+
+{
+  "name": "Shawarma House",
+  "description": "Chicken and beef shawarma",
+  "address": "King Fahd Rd, Riyadh",
+  "phoneNumber": "+966500000000"
+}
+
+### Update a restaurant (its owner or Admin)
+PUT {{host}}/api/restaurants/1
+Authorization: Bearer {{ownerToken}}
+Content-Type: application/json
+
+{
+  "name": "Shawarma House",
+  "address": "King Fahd Rd, Riyadh",
+  "isActive": true
+}
+
+### Without a token → 401
+POST {{host}}/api/restaurants
+Content-Type: application/json
+
+{ "name": "No Auth", "address": "x" }
+
+### ===== Menu items =====
+
+### List a restaurant's menu (public)
+GET {{host}}/api/restaurants/1/menu-items
+
+### Add a menu item (restaurant's owner or Admin)
+POST {{host}}/api/restaurants/1/menu-items
+Authorization: Bearer {{ownerToken}}
+Content-Type: application/json
+
+{
+  "name": "Chicken Shawarma",
+  "price": 15.50,
+  "category": "Sandwiches"
+}
+
+### Delete a menu item (restaurant's owner or Admin)
+DELETE {{host}}/api/restaurants/1/menu-items/1
+Authorization: Bearer {{ownerToken}}
+
+### ===== Orders =====
+
+### Log in as the customer — the token is reused below
+# @name loginCustomer
+POST {{host}}/api/auth/login
+Content-Type: application/json
+
+{
+  "email": "customer@example.com",
+  "password": "Passw0rd!"
+}
+
+###
+@customerToken = {{loginCustomer.response.body.token}}
+
+### Place an order (Customer). Only ids + quantities: prices/total come from the server.
+POST {{host}}/api/orders
+Authorization: Bearer {{customerToken}}
+Content-Type: application/json
+
+{
+  "restaurantId": 1,
+  "deliveryAddress": "Olaya St, Riyadh",
+  "items": [
+    { "menuItemId": 1, "quantity": 2 }
+  ]
+}
+
+### My orders (customer) — owners see their restaurants' orders, admins see all
+GET {{host}}/api/orders?page=1&pageSize=20
+Authorization: Bearer {{customerToken}}
+
+### Filter by status
+GET {{host}}/api/orders?status=Pending
+Authorization: Bearer {{ownerToken}}
+
+### One order
+GET {{host}}/api/orders/1
+Authorization: Bearer {{customerToken}}
+
+### Owner moves the order forward: Pending → Confirmed → Preparing → OutForDelivery → Delivered
+PATCH {{host}}/api/orders/1/status
+Authorization: Bearer {{ownerToken}}
+Content-Type: application/json
+
+{ "status": "Confirmed" }
+
+### Customer cancels (only while Pending)
+PATCH {{host}}/api/orders/1/status
+Authorization: Bearer {{customerToken}}
+Content-Type: application/json
+
+{ "status": "Cancelled" }
