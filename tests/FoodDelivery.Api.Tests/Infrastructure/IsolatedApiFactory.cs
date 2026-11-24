@@ -9,10 +9,14 @@ using Microsoft.Extensions.DependencyInjection;
 namespace FoodDelivery.Api.Tests.Infrastructure;
 
 /// <summary>
-/// A second app instance with small rate limits, pointing at the shared (already migrated)
-/// test database. Create one per test so every test starts with empty rate-limit counters.
+/// A separate app instance with its own settings (and optionally replaced services), pointing
+/// at the shared, already migrated test database. Create one per test so in-memory state such
+/// as rate-limit counters or a fake clock is never shared between tests.
 /// </summary>
-public class RateLimitedApiFactory(string connectionString, IDictionary<string, string?> settings)
+public class IsolatedApiFactory(
+    string connectionString,
+    IDictionary<string, string?> settings,
+    Action<IServiceCollection>? configureServices = null)
     : WebApplicationFactory<Program>
 {
     // TEST-ONLY: lets a test choose the client IP. Never do this in production code:
@@ -27,7 +31,10 @@ public class RateLimitedApiFactory(string connectionString, IDictionary<string, 
         foreach (var (key, value) in settings) builder.UseSetting(key, value);
 
         builder.ConfigureTestServices(services =>
-            services.AddSingleton<IStartupFilter, FakeClientIpStartupFilter>());
+        {
+            services.AddSingleton<IStartupFilter, FakeClientIpStartupFilter>();
+            configureServices?.Invoke(services);
+        });
     }
 
     public HttpClient CreateClientFromIp(string ip)

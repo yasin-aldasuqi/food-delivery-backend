@@ -11,6 +11,11 @@ public class User
     public required string PasswordHash { get; set; }
 
     public UserRole Role { get; set; } = UserRole.Customer;
+
+    // Account lockout: consecutive failed logins, and when the current lockout ends (null = not locked).
+    // Storing the end time means a lockout expires by itself; nothing has to "unlock" it.
+    public int FailedLoginCount { get; set; }
+    public DateTime? LockoutEnd { get; set; }
     public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
 
     // Navigation properties
